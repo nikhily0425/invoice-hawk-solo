@@ -1,0 +1,9 @@
+boto3
+imapclient
+email-validator
+python-dotenv
+requests
+psycopg2-binary
+SQLAlchemy
+fastapi
+uvicorn
