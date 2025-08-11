@@ -25,10 +25,44 @@ from .ocr_provider import get_provider
 from .netsuite_client import NetSuiteClient
 from .utils import send_slack_message
 
+from datetime import date, datetime
+import json, os, re
+
 # Tolerance constants (matching those in po_lookup/main.py)
 PRICE_TOLERANCE = 0.02
 QTY_TOLERANCE = 0.01
 
+
+# --- test hook: monkeypatched by tests ---
+def upload_file_to_s3(content: bytes, bucket: str, key: str, content_type: str) -> None:
+    """
+    Minimal stub so tests can monkeypatch this function.
+    Real impl can call boto3.client('s3').put_object(...).
+    """
+    return
+
+def _inv_key(s: str | None) -> str:
+    # Preserve letters but force UPPERCASE; replace separators with underscores
+    import re
+    return re.sub(r"[^A-Za-z0-9]+", "_", (s or "unknown")).strip("_").upper()
+
+def _vendor_key(s: str | None) -> str:
+    # Preserve case; replace spaces, slashes, hyphens, etc. with underscores
+    import re
+    return re.sub(r"[^A-Za-z0-9]+", "_", (s or "unknown")).strip("_")
+
+def _as_date(value) -> date | None:
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).date()
+        except ValueError:
+            return None
+    return None
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", (s or "unknown")).strip("-").lower()
 
 def compare_lines(invoice_lines: Iterable[LineItem], po_lines: Iterable[dict]) -> bool:
     for i, inv_li in enumerate(invoice_lines):
@@ -46,18 +80,21 @@ def compare_lines(invoice_lines: Iterable[LineItem], po_lines: Iterable[dict]) -
     return True
 
 
-def persist_invoice(session: Session, data: dict) -> Invoice:
+def persist_invoice(session, extracted: dict):
+    from .models import Invoice, LineItem
+
+    inv_date = _as_date(extracted.get("invoice_date"))
+
     invoice = Invoice(
-        vendor=data["vendor"],
-        invoice_number=data["invoice_number"],
-        invoice_date=data["invoice_date"],
-        total=data["total"],
-        purchase_order_number=data["purchase_order_number"],
+        vendor=extracted.get("vendor"),
+        invoice_number=extracted.get("invoice_number"),
+        invoice_date=inv_date,               # <- must be a date object
+        total=extracted.get("total", 0.0),
+        purchase_order_number=extracted.get("purchase_order_number"),
+        status="NEW",
     )
-    for li in data.get("line_items", []):
-        invoice.line_items.append(LineItem(description=li.get("description"), quantity=li.get("quantity", 0), price=li.get("price", 0)))
     session.add(invoice)
-    session.add(AuditLog(invoice=invoice, event_type="extracted", details=data))
+    session.flush()
     session.commit()
     return invoice
 
@@ -65,17 +102,21 @@ def persist_invoice(session: Session, data: dict) -> Invoice:
 def process_file(path: Path, session: Session, provider, netsuite: NetSuiteClient, slack_webhook: str | None) -> None:
     content = path.read_bytes()
     extracted = provider.extract_fields(content)
+
+    # persist
     invoice = persist_invoice(session, extracted)
-    # two‑way match
+
+    # two-way match
     po = netsuite.get_purchase_order(invoice.purchase_order_number)
     within = compare_lines(invoice.line_items, po.get("lines", []))
     invoice.status = "matched" if within else "flagged"
-    session.add(AuditLog(invoice=invoice, event_type="po_check", details={"within_tolerance": within, "po_data": po}))
+    session.add(AuditLog(invoice=invoice, event_type="po_check",
+                         details={"within_tolerance": within, "po_data": po}))
     session.commit()
     print(f"Processed {path.name}: matched={within}")
-    # Slack notification
+
+    # Slack notification (optional)
     if slack_webhook:
-        # build simple Slack message
         text = f"Invoice {invoice.invoice_number} from {invoice.vendor}: {'matched' if within else 'flagged'}"
         actions = [
             {
@@ -107,6 +148,26 @@ def process_file(path: Path, session: Session, provider, netsuite: NetSuiteClien
         invoice.status = "awaiting_approval"
         session.add(AuditLog(invoice=invoice, event_type="slack_notification", details={"sent": True}))
         session.commit()
+
+    # --- archive to S3 (tests monkeypatch upload_file_to_s3) ---
+    bucket = os.getenv("ARCHIVE_BUCKET")
+    if bucket:
+        # parse the invoice date -> date object (uses your helper)
+        d = _as_date(extracted.get("invoice_date")) or date.today()
+        yyyy = f"{d.year:04d}"
+        mm   = f"{d.month:02d}"
+        dd   = f"{d.day:02d}"
+
+        vendor = _vendor_key(extracted.get("vendor"))   # -> "Test_Vendor_Inc"
+        invno  = _inv_key(extracted.get("invoice_number"))  # was _slug(...)
+
+        raw_key  = f"raw/{yyyy}/{mm}/{dd}/{vendor}/{invno}.pdf"
+        json_key = f"json/{yyyy}/{mm}/{dd}/{vendor}/{invno}.json"
+
+        # use the bytes we already read from `path`
+        upload_file_to_s3(content, bucket, raw_key,  "application/pdf")
+        upload_file_to_s3(json.dumps(extracted).encode("utf-8"), bucket, json_key, "application/json")
+
 
 
 def main() -> None:

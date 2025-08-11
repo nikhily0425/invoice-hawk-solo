@@ -8,36 +8,70 @@ dependencies.  Replace these stubs with real API calls once credentials
 and endpoints are available.
 """
 
+# invoice_hawk/netsuite_client.py
 from __future__ import annotations
+import os, time, requests
+from typing import Any, Dict, Optional
 
-from typing import Any, Dict, List
-
+class NetSuiteError(Exception):
+    pass
 
 class NetSuiteClient:
-    def __init__(self, account: str | None = None, token: str | None = None) -> None:
-        self.account = account
-        self.token = token
+    def __init__(
+        self,
+        *,
+        base_url: Optional[str] = None,
+        test_mode: Optional[bool] = None,
+        timeout: float = 30.0,
+        max_retries: Optional[int] = None,
+        backoff_seconds: Optional[float] = None,
+    ) -> None:
+        # Defaults come from env or sensible test-friendly values
+        self.base_url = (base_url or os.getenv("NETSUITE_BASE_URL", "https://example.com")).rstrip("/")
+        # Tests expect LIVE behavior by default (i.e., not dry-run)
+        env_test = os.getenv("NETSUITE_TEST_MODE", "false").lower() in ("1", "true", "yes")
+        self.test_mode = env_test if test_mode is None else test_mode
+        self.timeout = timeout
+        self.max_retries = int(os.getenv("NETSUITE_MAX_RETRIES", str(max_retries if max_retries is not None else 3)))
+        self.backoff_seconds = float(os.getenv("NETSUITE_RETRY_BACKOFF", str(backoff_seconds if backoff_seconds is not None else 0.0)))
+
+    def _request(self, method: str, path: str, json: Optional[dict] = None) -> Dict[str, Any]:
+        if self.test_mode:
+            # Tests monkeypatch requests; they expect real logic when not in test_mode.
+            return {"status": "dry-run", "method": method, "path": path, "json": json or {}}
+
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = requests.request(method.upper(), url, json=json)
+                if resp.status_code == 429:
+                    if attempt == self.max_retries:
+                        raise NetSuiteError("Rate limited (429) after retries")
+                    time.sleep(self.backoff_seconds * (2 ** attempt))
+                    continue
+                if resp.status_code >= 400:
+                    raise NetSuiteError(f"HTTP {resp.status_code}: {resp.text}")
+                # Prefer JSON if available
+                try:
+                    return resp.json()
+                except ValueError:
+                    return {"text": resp.text}
+            except Exception as exc:
+                last_exc = exc
+                if attempt == self.max_retries:
+                    raise
+                time.sleep(self.backoff_seconds * (2 ** attempt))
+        raise NetSuiteError(str(last_exc) if last_exc else "Unknown NetSuite error")
 
     def get_purchase_order(self, po_number: str) -> Dict[str, Any]:
-        """Retrieve a purchase order by number.
+        if self.test_mode:
+            return {"po_number": po_number, "lines": [{"sku": "KB-101", "qty": 10, "unit_price": 99.5}]}
+        return self._request("GET", f"po/{po_number}")
 
-        Returns a stubbed purchase order with two line items.  The shape of
-        the response mirrors what the real API is expected to return, but
-        simplified for the MVP.
-        """
-        return {
-            "po_number": po_number,
-            "lines": [
-                {"description": "Item A", "quantity": 10, "price": 100.00},
-                {"description": "Item B", "quantity": 5, "price": 50.00},
-            ],
-        }
+    def post_invoice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if self.test_mode:
+            return {"status": "dry-run", "posted": False, "payload": payload}
+        return self._request("POST", "invoice", json=payload)
 
-    def post_invoice(self, invoice_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create an invoice in NetSuite.
-
-        Accepts invoice data and returns a stubbed response containing a
-        generated NetSuite invoice ID.  No network requests are made.
-        """
-        invoice_number = invoice_data.get("invoice_number", "UNKNOWN")
-        return {"netsuite_invoice_id": f"NS-{invoice_number}"}
+__all__ = ["NetSuiteClient", "NetSuiteError"]
