@@ -1,0 +1,133 @@
+diff a/README.md b/README.md	(rejected hunks)
+@@ -1,2 +1,129 @@
+-# invoice-hawk-solo
+-invoice-hawk-solo
++# Invoice Hawk – Solo MVP
++
++Invoice Hawk automates the accounts‑payable (AP) process for small teams
++by performing two‑way matching between vendor invoices and purchase
++orders.  It extracts structured data from PDF invoices using
++OpenAI’s GPT Vision API, looks up the corresponding purchase order in
++NetSuite, checks quantities and prices within configured tolerances,
++sends Slack notifications for approval, archives documents to S3, and
++records an audit trail in a relational database.  This repository
++contains a serverless MVP implementation designed for a single
++developer.
++
++## Features
++
++- **OCR extraction** – Uses GPT Vision (`gpt-4o`) to extract vendor,
++  invoice number, invoice date, total, purchase order number and line
++  items (description/quantity/price) from PDF invoices.  When no
++  `OPENAI_API_KEY` is configured, a fallback parser returns
++  deterministic stub data for testing.
++- **NetSuite integration** – Retrieves purchase orders and posts
++  invoices to a NetSuite sandbox.  Supports rate‑limit retries and a
++  test mode (`NETSUITE_TEST_MODE=true`) that avoids external side
++  effects.
++- **Slack approvals** – Sends invoice summaries to Slack via an incoming
++  webhook with Approve ✅ and Reject ❌ buttons.  A FastAPI endpoint
++  verifies Slack signatures and updates invoice status based on user
++  clicks.
++- **S3 archiving** – Stores raw PDFs and extracted JSON in S3
++  (`ARCHIVE_BUCKET`) under date‑ and vendor‑based prefixes.  All
++  processing events are recorded in an audit log.
++- **CLI and serverless packaging** – A command‑line interface runs the
++  entire pipeline locally for development.  A `serverless.yml`
++  describes AWS Lambda functions for OCR and Slack interactions, and
++  GitHub Actions includes a dry‑run packaging step.
++
++## Requirements
++
++- Python 3.11
++- pip for installing dependencies
++- AWS credentials and an S3 bucket for archiving (optional)
++- A NetSuite sandbox account (optional; can run in test mode)
++- Slack workspace and incoming webhook URL for notifications
++- An OpenAI API key for GPT Vision (optional; fallback used if absent)
++
++Install dependencies using:
++
++```bash
++pip install -r requirements.txt
++```
++
++## Environment variables
++
++Create a `.env` file or export the following variables to configure
++Invoice Hawk:
++
++| Variable | Description |
++|---------|-------------|
++| `DATABASE_URL` | SQLAlchemy URL for the Postgres/SQLite database (e.g. `sqlite:///invoice.db`). |
++| `OPENAI_API_KEY` | OpenAI API key for GPT Vision.  Optional; use fallback if unset. |
++| `OCR_PROVIDER` | Set to `gpt` to enable GPT Vision, or `fallback` to always use the stub. |
++| `NETSUITE_BASE_URL` | Base URL of the NetSuite REST API (e.g. `https://<account>.suitetalk.api.netsuite.com/services/rest`). |
++| `NETSUITE_ACCOUNT` | NetSuite account ID. |
++| `NETSUITE_TOKEN` | Bearer or OAuth token for NetSuite authentication. |
++| `NETSUITE_TEST_MODE` | Set to `true` to avoid posting invoices and return stubbed responses. |
++| `NETSUITE_MAX_RETRIES` | Maximum number of retries on HTTP 429 responses (default 3). |
++| `NETSUITE_RETRY_BACKOFF` | Seconds to wait between retries (default 1.0). |
++| `SLACK_WEBHOOK_URL` | Incoming webhook URL for sending invoice notifications. |
++| `SLACK_SIGNING_SECRET` | Slack signing secret used to verify interactive payloads. |
++| `SLACK_BOT_TOKEN` | (optional) Slack bot token for updating messages via the Web API. |
++| `ARCHIVE_BUCKET` | Name of the S3 bucket used to archive PDFs and JSON. |
++| `S3_BUCKET` | Alias for `ARCHIVE_BUCKET` for backwards compatibility. |
++
++## Running the CLI locally
++
++You can process one or more PDF invoices locally using the command‑line
++interface.  Ensure your database is configured (e.g. SQLite) and that
++you have set `SLACK_WEBHOOK_URL` if you wish to send notifications.
++
++```bash
++python -m invoice_hawk.cli \
++  --input "data/*.pdf" \
++  --database-url sqlite:///invoice.db \
++  --slack-webhook $SLACK_WEBHOOK_URL
++```
++
++The CLI will archive raw PDFs and extracted JSON to S3 if
++`ARCHIVE_BUCKET` is set, perform OCR extraction, match line items
++against purchase orders, update invoice status, and send a Slack message
++with Approve/Reject buttons.
++
++## Running the Slack interactive API
++
++To handle Approve/Reject button clicks, run the FastAPI app locally:
++
++```bash
++uvicorn invoice_hawk.slack_app:app --host 0.0.0.0 --port 8000
++```
++
++Configure Slack to send interactive requests to `http://<ngrok-or-host>:8000/slack/actions` and set
++`SLACK_SIGNING_SECRET` in your environment.  When a user clicks a
++button, the invoice status is updated and a confirmation message is sent.
++
++## Packaging for AWS
++
++The repository includes a `serverless.yml` file that defines two
++functions: an OCR worker triggered by S3 object creation and an
++HTTP API for Slack actions.  You can perform a dry‑run package using
++the Serverless Framework:
++
++```bash
++npm install -g serverless
++serverless package --package build --stage dev
++```
++
++This command generates a CloudFormation template in the `build`
++directory without deploying.  See `.github/workflows/ci.yml` for the
++GitHub Actions configuration that runs this packaging step.
++
++## Running tests
++
++Run the unit test suite with coverage to ensure at least 70 % test
++coverage:
++
++```bash
++pytest --cov=invoice_hawk --cov-report=term-missing
++```
++
++The tests include cases for OCR provider fallback and JSON parsing,
++NetSuite retry logic, Slack signature validation, and S3 key naming.
