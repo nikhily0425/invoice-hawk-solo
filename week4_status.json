@@ -1,0 +1,19 @@
+{
+  "week": 4,
+  "date_range": "2025-08-14 to 2025-08-20",
+  "completed_tasks": [
+    "Updated serverless.yml to define HTTP-based Lambda functions (ocrExtract and slackActions) with safe environment defaults, least-privilege IAM policies, region configuration, and automatic creation of an archive S3 bucket when none is provided.",
+    "Enhanced the OCR lambda to decode base64 PDF input, extract invoice fields via GPT Vision or fallback, persist invoices and audit logs to the database, archive raw and JSON documents to S3, perform a two-way match against NetSuite purchase orders, and send Slack notifications.",
+    "Added a smoke test script (scripts/smoke.sh) that exercises the deployed OCR and Slack endpoints using a tiny base64-encoded PDF and a signed Slack payload.",
+    "Created deploy_checklist.md describing prerequisites, step-by-step deployment instructions, smoke testing, rollback procedures, and cost considerations.",
+    "Added a deploy-dev job to the GitHub Actions workflow that packages and deploys the serverless stack on manual trigger or version tags, using AWS OIDC credentials.",
+    "Updated README with deployment instructions, environment configuration details, smoke test usage, and emphasised cost-saving defaults."
+  ],
+  "next_steps": [
+    "Wire Slack interactive buttons to update invoice status and initiate NetSuite invoice posting upon approval.",
+    "Integrate with the actual NetSuite sandbox for creating invoices once approved and refine the mapping of line items based on live responses.",
+    "Add end-to-end integration tests covering S3 archiving, database persistence, and Slack callbacks.",
+    "Monitor AWS resource usage in staging and optimise Lambda memory, timeouts and concurrency to reduce costs."
+  ],
+  "blockers": []
+}
