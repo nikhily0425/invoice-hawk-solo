@@ -1,0 +1,42 @@
+service: invoice-hawk
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  stage: dev
+  environment:
+    DATABASE_URL: ${env:DATABASE_URL}
+    SLACK_WEBHOOK_URL: ${env:SLACK_WEBHOOK_URL}
+    SLACK_SIGNING_SECRET: ${env:SLACK_SIGNING_SECRET}
+    SLACK_BOT_TOKEN: ${env:SLACK_BOT_TOKEN}
+    OPENAI_API_KEY: ${env:OPENAI_API_KEY}
+    NETSUITE_BASE_URL: ${env:NETSUITE_BASE_URL}
+    NETSUITE_TOKEN: ${env:NETSUITE_TOKEN}
+    NETSUITE_ACCOUNT: ${env:NETSUITE_ACCOUNT}
+    NETSUITE_TEST_MODE: ${env:NETSUITE_TEST_MODE}
+    ARCHIVE_BUCKET: ${env:ARCHIVE_BUCKET}
+
+functions:
+  ocrWorker:
+    handler: invoice_hawk/lambda_functions/ocr_extract/main.handler
+    events:
+      - s3:
+          bucket: ${env:ARCHIVE_BUCKET}
+          event: s3:ObjectCreated:*
+          rules:
+            - suffix: .pdf
+  slackActions:
+    handler: invoice_hawk/slack_app.app
+    events:
+      - httpApi:
+          path: /slack/actions
+          method: POST
+
+package:
+  patterns:
+    - '!node_modules/**'
+    - '!**/*.test.*'
+    - '!tests/**'
