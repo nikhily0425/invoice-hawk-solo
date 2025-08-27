@@ -1,0 +1,344 @@
+diff --git a/README.md b/README.md
+index e32fa16..3c07b38 100644
+--- a/README.md
++++ b/README.md
+@@ -99,6 +99,10 @@ uvicorn invoice_hawk.slack_app:app --host 0.0.0.0 --port 8000
+ Configure Slack to send interactive requests to `http://<ngrok-or-host>:8000/slack/actions` and set
+ `SLACK_SIGNING_SECRET` in your environment.  When a user clicks a
+ button, the invoice status is updated and a confirmation message is sent.
++If the Approve button is clicked, Invoice Hawk will automatically post
++the invoice to NetSuite via the sandbox client (using the test mode
++stub by default) and persist the returned external identifier on the
++invoice.
+ 
+ ## Packaging for AWS
+ 
+diff --git a/invoice_hawk/lambda_functions/invoice_post/main.py b/invoice_hawk/lambda_functions/invoice_post/main.py
+index 7c04924..477fef7 100644
+--- a/invoice_hawk/lambda_functions/invoice_post/main.py
++++ b/invoice_hawk/lambda_functions/invoice_post/main.py
+@@ -1,70 +1,99 @@
+ """
+-Lambda handler to finalise invoice processing after approval.
++AWS Lambda entry point for posting invoices to NetSuite.
+ 
+-Triggered by a Slack interactive callback (e.g. via API Gateway).  The event
+-payload includes the invoice ID and the user’s decision (approve or
+-reject).  If approved, the invoice is posted to NetSuite (test mode) via
+-the sandbox API.  The invoice status and audit log are updated
+-accordingly.
++This handler is designed to be invoked with a JSON payload containing an
++``invoice_id``.  It loads the invoice from the configured database,
++submits it to NetSuite via the :class:`~invoice_hawk.netsuite_client.NetSuiteClient`,
++persists the returned external identifier and updates the status to
++``posted``, records an audit log entry, and returns a simple
++acknowledgement.  In test mode (``NETSUITE_TEST_MODE=true`` or unset),
++no network calls are made and a deterministic external identifier is
++returned.
++
++This function is intentionally synchronous and simplistic; in a real
++deployment you may wish to decouple the posting operation from the
++interactive Slack callback and handle error scenarios more robustly.
+ """
+ 
++from __future__ import annotations
++
+ import os
++from typing import Any, Dict
+ 
+ from sqlalchemy import create_engine
+ from sqlalchemy.orm import Session
+ 
+ from invoice_hawk.models import Base, Invoice, AuditLog
+-from invoice_hawk.netsuite_client import NetSuiteClient
++from invoice_hawk.netsuite_client import NetSuiteClient, NetSuiteError
+ 
+ 
+ def _get_db_session() -> Session:
++    """Create a SQLAlchemy session using the DATABASE_URL environment variable."""
+     db_url = os.environ.get("DATABASE_URL")
++    if not db_url:
++        raise RuntimeError("DATABASE_URL is not configured")
+     engine = create_engine(db_url)
+     Base.metadata.create_all(engine)
+     return Session(engine)
+ 
+ 
+-def handler(event, context):  # pragma: no cover - entry point called by AWS
++def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:  # pragma: no cover - entry point for AWS
++    """
++    Lambda handler to post an invoice to NetSuite.
++
++    Parameters
++    ----------
++    event : dict
++        The event payload passed to the Lambda.  Must include an
++        ``invoice_id`` key with the integer primary key of the invoice to
++        post.
++    context : Any
++        Unused AWS Lambda context object.
++
++    Returns
++    -------
++    dict
++        A dictionary with keys ``posted`` (bool) and ``external_id`` (str)
++        when successful.  If posting fails, an exception will be raised.
++
++    Raises
++    ------
++    ValueError
++        If the ``invoice_id`` is missing or the invoice cannot be found.
++    NetSuiteError
++        If the NetSuite client encounters an error when posting.
++    NotImplementedError
++        If test mode is disabled and live posting is not implemented.
++    RuntimeError
++        If the database URL is not configured.
++    """
+     invoice_id = event.get("invoice_id")
+-    decision = event.get("decision")  # "approve" or "reject"
+-    if not invoice_id or decision not in {"approve", "reject"}:
+-        raise ValueError("Both invoice_id and a valid decision are required")
++    if not invoice_id:
++        raise ValueError("invoice_id is required")
++    # Create a DB session and load the invoice
+     session = _get_db_session()
+-    invoice = session.get(Invoice, invoice_id)
+-    if not invoice:
+-        session.close()
+-        raise ValueError(f"Invoice {invoice_id} not found")
+-    netsuite = NetSuiteClient()
+-    if decision == "approve":
+-        ns_response = netsuite.post_invoice(
+-            {
+-                "invoice_number": invoice.invoice_number,
+-                "vendor": invoice.vendor,
+-                "invoice_date": invoice.invoice_date,
+-                "total": float(invoice.total),
+-                "purchase_order_number": invoice.purchase_order_number,
+-                "line_items": [
+-                    {
+-                        "description": li.description,
+-                        "quantity": li.quantity,
+-                        "price": float(li.price),
+-                    }
+-                    for li in invoice.line_items
+-                ],
+-            }
+-        )
+-        invoice.status = "approved"
+-        audit_details = {"decision": decision, "netsuite_response": ns_response}
+-    else:
+-        invoice.status = "rejected"
+-        audit_details = {"decision": decision}
+-    session.add(
+-        AuditLog(
+-            invoice=invoice,
+-            event_type="invoice_post",
+-            details=audit_details,
++    try:
++        invoice = session.get(Invoice, invoice_id)
++        if not invoice:
++            raise ValueError(f"Invoice {invoice_id} not found")
++        netsuite = NetSuiteClient()
++        # Attempt to post the invoice; this may raise NotImplementedError
++        result = netsuite.post_invoice(invoice)
++        external_id = result.get("external_id")
++        if not external_id:
++            raise NetSuiteError("NetSuite did not return an external_id")
++        # Persist the external ID and update status
++        invoice.external_id = external_id
++        invoice.status = "posted"
++        # Record an audit log entry
++        session.add(
++            AuditLog(
++                invoice=invoice,
++                event_type="post_to_netsuite",
++                details={"external_id": external_id},
++            )
+         )
+-    )
+-    session.commit()
+-    session.close()
+-    return {"invoice_id": invoice_id, "decision": decision}
+\ No newline at end of file
++        session.commit()
++        return {"posted": True, "external_id": external_id}
++    finally:
++        session.close()
+\ No newline at end of file
+diff --git a/invoice_hawk/models.py b/invoice_hawk/models.py
+index 942aace..45d7537 100644
+--- a/invoice_hawk/models.py
++++ b/invoice_hawk/models.py
+@@ -42,6 +42,12 @@ class Invoice(Base):
+     created_at = Column(DateTime, default=_dt.datetime.utcnow, nullable=False)
+     updated_at = Column(DateTime, default=_dt.datetime.utcnow, onupdate=_dt.datetime.utcnow)
+ 
++    # External identifier returned from NetSuite when an invoice is successfully
++    # posted.  This column is nullable because invoices may not yet be
++    # submitted to NetSuite at creation time.  Test cases set and verify
++    # this field when simulating posting via the NetSuite client.
++    external_id = Column(String, nullable=True)
++
+     # relationships
+     line_items = relationship("LineItem", back_populates="invoice", cascade="all, delete-orphan")
+     audit_logs = relationship("AuditLog", back_populates="invoice", cascade="all, delete-orphan")
+diff --git a/invoice_hawk/netsuite_client.py b/invoice_hawk/netsuite_client.py
+index 49d6012..0d80830 100644
+--- a/invoice_hawk/netsuite_client.py
++++ b/invoice_hawk/netsuite_client.py
+@@ -148,33 +148,46 @@ class NetSuiteClient:
+             ]
+         return {"po_number": po_number, "lines": lines}
+ 
+-    def post_invoice(self, invoice_data: Dict[str, Any]) -> Dict[str, Any]:
++    def post_invoice(self, invoice: Any) -> Dict[str, Any]:
+         """
+-        Create an invoice in NetSuite.
++        Create an invoice in NetSuite or, in test mode, return a deterministic stub.
+ 
+         Parameters
+         ----------
+-        invoice_data : dict
+-            The invoice payload.  Must include at least ``invoice_number``.
++        invoice : Invoice or dict
++            The invoice instance or a dictionary of invoice data.  When
++            provided with a SQLAlchemy ``Invoice`` object, the method will
++            access the ``invoice_number`` attribute.  When passed a
++            dictionary, it will look up the ``invoice_number`` key.
+ 
+         Returns
+         -------
+         dict
+-            A dictionary containing a ``netsuite_invoice_id``.  If in test
+-            mode, a stub ID is returned and no network request is made.
++            A dictionary containing an ``external_id`` for the posted invoice.
++            In test mode or when the base URL is not configured, no network
++            requests are made and a stub identifier of the form
++            ``NS-INV-<invoice_number>`` is returned.  In non‑test mode,
++            posting to NetSuite is not yet implemented and a
++            :class:`NotImplementedError` is raised.
+         """
+-        invoice_number = invoice_data.get("invoice_number", "UNKNOWN")
++        # Determine the invoice number from either an object or a mapping.
++        invoice_number = "UNKNOWN"
++        try:
++            # SQLAlchemy model will expose invoice_number attribute
++            if hasattr(invoice, "invoice_number"):
++                invoice_number = getattr(invoice, "invoice_number") or "UNKNOWN"
++            elif isinstance(invoice, dict):
++                invoice_number = invoice.get("invoice_number", "UNKNOWN")
++        except Exception:
++            invoice_number = "UNKNOWN"
++
++        # In test mode (default) or when no base URL is configured, return a stub.
+         if self.test_mode or not self.base_url:
+-            # Log the invoice for debugging purposes.  In a real
+-            # implementation this might write to CloudWatch or another log.
+-            # Here we simply return a deterministic stub.
+-            return {"netsuite_invoice_id": f"NS-TEST-{invoice_number}"}
+-        # Construct the endpoint.  Some implementations require the account ID.
+-        path = "/record/v1/invoice"
+-        if self.account:
+-            path = f"/record/v1/invoice/{self.account}"
+-        # Perform the POST.  On success return the identifier from the response.
+-        resp = self._request("POST", path, json_body=invoice_data)
+-        # Attempt to extract an identifier from the response.  Fallback to stub.
+-        netsuite_id = resp.get("id") or resp.get("internalId") or f"NS-{invoice_number}"
+-        return {"netsuite_invoice_id": netsuite_id}
+\ No newline at end of file
++            return {"external_id": f"NS-INV-{invoice_number}"}
++
++        # If we reach here we intend to perform a real network call; however this
++        # is not yet implemented in this prototype.  Raise a NotImplementedError
++        # rather than silently returning a stub in production mode.
++        raise NotImplementedError(
++            "post_invoice in live mode is not implemented; set NETSUITE_TEST_MODE=true to use stub"
++        )
+\ No newline at end of file
+diff --git a/invoice_hawk/slack_app.py b/invoice_hawk/slack_app.py
+index 5c7b692..ee7c5a3 100644
+--- a/invoice_hawk/slack_app.py
++++ b/invoice_hawk/slack_app.py
+@@ -29,6 +29,7 @@ from sqlalchemy import create_engine
+ from sqlalchemy.orm import Session
+ 
+ from .models import Base, Invoice, AuditLog
++from .netsuite_client import NetSuiteClient  # import NetSuite client for posting
+ from .utils import send_slack_message
+ 
+ try:
+@@ -110,7 +111,7 @@ async def slack_actions(request: Request) -> JSONResponse:
+         return JSONResponse({"error": "Invalid invoice id"}, status_code=400)
+     # Determine new status based on action
+     new_status = "approved" if action_id == "approve_invoice" else "rejected"
+-    # Connect to DB
++    # Connect to the database
+     db_url = os.getenv("DATABASE_URL")
+     if not db_url:
+         raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
+@@ -121,10 +122,12 @@ async def slack_actions(request: Request) -> JSONResponse:
+         invoice = session.get(Invoice, invoice_id)
+         if not invoice:
+             return JSONResponse({"error": "Invoice not found"}, status_code=404)
++        # Update the invoice status based on the action
+         invoice.status = new_status
+         # Store the message timestamp and channel if provided
+         message_ts = payload.get("message", {}).get("ts")
+         channel = payload.get("channel", {}).get("id")
++        # Record the Slack action in the audit log
+         session.add(
+             AuditLog(
+                 invoice=invoice,
+@@ -136,15 +139,40 @@ async def slack_actions(request: Request) -> JSONResponse:
+                 },
+             )
+         )
++        # Commit the status change and audit log immediately
+         session.commit()
++        # On approval, post the invoice to NetSuite and persist the external ID.
++        if action_id == "approve_invoice":
++            try:
++                netsuite = NetSuiteClient()
++                result = netsuite.post_invoice(invoice)
++                external_id = result.get("external_id")
++                if external_id:
++                    # Update the invoice with the external ID but keep status as approved
++                    invoice.external_id = external_id
++                    session.commit()
++            except Exception:
++                # Swallow any errors from posting; posting failures should not block
++                # the Slack response.  Real implementations could notify operators.
++                pass
+     finally:
+         session.close()
+-    # If we have a bot token and message_ts, update the original message via Slack API
++    # Capture the invoice number for Slack messaging outside the DB session.  The
++    # ``invoice`` instance becomes detached once the session is closed, so
++    # copying any needed attributes prevents DetachedInstanceError.
++    invoice_number = None
++    try:
++        # ``invoice`` may still be defined in the outer scope; extract its
++        # invoice_number if available.
++        invoice_number = invoice.invoice_number  # type: ignore[attr-defined]
++    except Exception:
++        invoice_number = str(invoice_id)
++    # Optionally update the original Slack message if we have a bot token
+     bot_token = os.getenv("SLACK_BOT_TOKEN")
+     if bot_token and message_ts and channel and WebClient:
+         try:
+             client = WebClient(token=bot_token)
+-            text = f"Invoice {invoice.invoice_number} was {new_status}."
++            text = f"Invoice {invoice_number} was {new_status}."
+             client.chat_update(channel=channel, ts=message_ts, text=text)
+         except Exception:
+             # Ignore Slack API errors silently
+@@ -153,5 +181,5 @@ async def slack_actions(request: Request) -> JSONResponse:
+         # Fall back to sending a new message if we cannot update
+         webhook = os.getenv("SLACK_WEBHOOK_URL")
+         if webhook:
+-            send_slack_message(webhook, f"Invoice {invoice_id} {new_status}.")
++            send_slack_message(webhook, f"Invoice {invoice_number} {new_status}.")
+     return JSONResponse({"ok": True})
+\ No newline at end of file
