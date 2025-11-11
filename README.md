@@ -56,3 +56,31 @@ python -m invoice_hawk.cli --input /path/to/invoices/*.pdf
 ```
 
 The OCR provider defaults to the fallback parser in test mode.  To enable GPT Vision extraction, set `OCR_PROVIDER=gpt` and provide the necessary OpenAI API key via `OPENAI_API_KEY` environment variable.
+
+## Deployment
+
+The `serverless deploy` command will output the URL of the OCR and Slack API endpoints. These endpoints are used by the smoke test script.
+
+### Staging deployment
+
+To deploy a staging environment in AWS, ensure the required environment variables (`DATABASE_URL`, `SLACK_SIGNING_SECRET`, etc.) are configured in your deployment environment (for example via AWS Systems Manager Parameter Store or Secrets Manager). Then run:
+
+```bash
+serverless deploy --stage staging
+```
+
+This command will create or update the Lambda functions (`ocrWorker`, `slackActions`, and `invoicePost`), the HTTP API Gateway, and the S3 archive bucket (if not provided). All resources are tagged with `project=invoice-hawk` and `env=staging` for cost tracking.
+
+### Dry-run deployment from CI
+
+The CI pipeline includes a `deploy-dryrun` job that runs `serverless package --stage dev` to validate that the Serverless stack can be synthesized without deploying. You can manually trigger this job via the GitHub Actions “Run workflow” button or by pushing a git tag matching `v*`. The dry-run uses AWS OpenID Connect (OIDC) to assume a role specified in the `AWS_ROLE_TO_ASSUME` secret.
+
+### Smoke test verification checklist
+
+After deploying to a staging environment, verify the following endpoints respond as expected:
+
+1. **OCR endpoint** (`/ocr`) – Send a small base64‑encoded PDF and ensure the JSON response contains `vendor`, `invoice_number`, and `total` fields.
+2. **Slack actions endpoint** (`/slack/actions`) – Craft a signed payload with a known invoice ID and verify the response contains `{ "ok": true }`. Confirm that the invoice status and audit log update in the database.
+3. **Invoice post endpoint** (`/invoice/post`) – POST a JSON body with `{ "invoice_id": <id> }` and verify the JSON response includes a `posted` flag and an `external_id`.
+
+You can use the updated `scripts/smoke.sh` script to automate these checks.

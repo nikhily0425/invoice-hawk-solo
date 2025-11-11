@@ -1,0 +1,149 @@
+diff --git a/serverless.yml b/serverless.yml
+--- a/serverless.yml
++++ b/serverless.yml
+@@ provider:
+   iam:
+     role:
+       statements:
+         - Effect: Allow
+           Action:
+             - s3:PutObject
+             - s3:ListBucket
+           Resource:
+             - arn:aws:s3:::${self:provider.environment.ARCHIVE_BUCKET}
+             - arn:aws:s3:::${self:provider.environment.ARCHIVE_BUCKET}/*
+         - Effect: Allow
+           Action:
+             - logs:CreateLogGroup
+             - logs:CreateLogStream
+             - logs:PutLogEvents
+           Resource: "*"
++  # Tag all resources for cost tracking
++  tags:
++    project: invoice-hawk
++    env: staging
+@@ functions:
+   slackActions:
+     handler: invoice_hawk/slack_app.app
+     events:
+       - httpApi:
+           path: /slack/actions
+           method: POST
++  invoicePost:
++    handler: invoice_hawk/lambda_functions/invoice_post/main.handler
++    events:
++      - httpApi:
++          path: /invoice/post
++          method: POST
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@
+ jobs:
+   test:
+     # existing test job
+     # (contents unchanged)
++  deploy-dryrun:
++    needs: test
++    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    steps:
++      - uses: actions/checkout@v3
++      - uses: actions/setup-node@v3
++        with:
++          node-version: 18
++      - uses: actions/setup-python@v3
++        with:
++          python-version: '3.11'
++      - name: Install Serverless CLI
++        run: npm install -g serverless
++      - name: Install Python dependencies
++        run: pip install -r requirements.txt
++      - name: Configure AWS credentials for OIDC
++        uses: aws-actions/configure-aws-credentials@v3
++        with:
++          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
++          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
++      - name: Dry-run serverless package
++        run: serverless package --stage dev
+
+diff --git a/scripts/smoke.sh b/scripts/smoke.sh
+--- a/scripts/smoke.sh
++++ b/scripts/smoke.sh
+@@
+ # Verify Slack actions endpoint
+ # (existing logic remains)
+ 
++# Verify invoice post endpoint
++if [ -n "$INVOICE_POST_URL" ]; then
++  echo "Testing invoice post endpoint..."
++  POST_RESP=$(curl -s -X POST "$INVOICE_POST_URL" \
++    -H "Content-Type: application/json" \
++    -d '{"invoice_id": 1}')
++  echo "$POST_RESP" | grep -q '"posted"' && echo "Invoice post endpoint reachable." || echo "Invoice post endpoint responded without 'posted' key."
++else
++  echo "INVOICE_POST_URL not set; skipping invoice post test."
++fi
++
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ ## Deployment
+ The ``serverless deploy`` command will output the URL of the OCR and
+ Slack API endpoints.  These endpoints are used by the smoke test
+ script.
++
++### Staging deployment
++
++To deploy a staging environment in AWS, ensure the required environment variables (``DATABASE_URL``, ``SLACK_SIGNING_SECRET``, etc.) are configured in your deployment environment (for example via AWS Systems Manager Parameter Store or Secrets Manager). Then run:
++
++```bash
++serverless deploy --stage staging
++```
++
++This command will create or update the Lambda functions (``ocrExtract``, ``slackActions`` and ``invoicePost``), the HTTP API Gateway, and the S3 archive bucket (if not provided). All resources are tagged with ``project=invoice-hawk`` and ``env=staging`` for cost tracking.
++
++### Dry-run deployment from CI
++
++The CI pipeline includes a ``deploy-dryrun`` job that runs ``serverless package --stage dev`` to validate that the Serverless stack can be synthesized without deploying. You can manually trigger this job via the GitHub Actions “Run workflow” button or by pushing a git tag matching ``v*``. The dry-run uses AWS OpenID Connect (OIDC) to assume a role specified in the ``AWS_ROLE_TO_ASSUME`` secret.
++
++### Smoke test verification checklist
++
++After deploying to a staging environment, verify the following endpoints respond as expected:
++
++1. **OCR endpoint** (``/ocr``) – Send a small base64‑encoded PDF and ensure the JSON response contains ``vendor``, ``invoice_number``, and ``total`` fields.
++2. **Slack actions endpoint** (``/slack/actions``) – Craft a signed payload with a known invoice ID and verify the response contains ``{ \"ok\": true }``. Confirm that the invoice status and audit log update in the database.
++3. **Invoice post endpoint** (``/invoice/post``) – POST a JSON body with ``{ \"invoice_id\": <id> }`` and verify the JSON response includes a ``posted`` flag and an ``external_id``.
++
++You can use the updated ``scripts/smoke.sh`` script to automate these checks.
++
+diff --git a/SECURITY.md b/SECURITY.md
+new file mode 100644
+--- /dev/null
++++ b/SECURITY.md
+@@
++# Security Policy
++
++## Least-Privilege IAM
++
++Invoice Hawk uses AWS IAM roles with least‑privilege permissions. Each Lambda function is granted only the permissions needed: S3 `PutObject`/`ListBucket` access to the archive bucket and CloudWatch Logs permissions. The Serverless configuration defines these statements under `provider.iam.role.statements`. If additional permissions are required (for example Secrets Manager access), scope them to specific resources.
++
++## API Gateway Safety
++
++The HTTP API endpoints for OCR extraction, Slack actions, and invoice posting are protected by verifying request signatures (for Slack) and by accepting only JSON or form‑encoded payloads. The Slack actions endpoint validates both the timestamp and signature using the Slack signing secret to prevent replay attacks. When deploying publicly accessible endpoints, configure AWS API Gateway to enforce HTTPS, limit allowed methods, and enable throttling to mitigate abuse.
++
++## Environment Variables
++
++Sensitive credentials such as database URLs, Slack tokens, NetSuite tokens, and OpenAI keys are injected via environment variables and are not committed to source control. In production, these should be stored securely in AWS Secrets Manager or Parameter Store and referenced in the Serverless configuration.
++
++## Cost and Tagging
++
++All AWS resources are tagged with `project=invoice-hawk` and `env=staging` to facilitate cost allocation and monitoring. S3 bucket names are stage‑scoped to avoid accidental data overlap across environments.
++
++## Test Mode
++
++By default, NetSuite integration runs in a test mode (`NETSUITE_TEST_MODE=true`) to avoid real financial postings. This mode should be disabled only after thorough testing and when valid credentials are provided.

@@ -7,6 +7,26 @@ provider:
   runtime: python3.11
   region: us-east-1
   stage: dev
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:ListBucket
+          Resource:
+            - arn:aws:s3:::${self:provider.environment.ARCHIVE_BUCKET}
+            - arn:aws:s3:::${self:provider.environment.ARCHIVE_BUCKET}/*
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+  # Tag all resources for cost tracking
+  tags:
+    project: invoice-hawk
+    env: staging
   environment:
     DATABASE_URL: ${env:DATABASE_URL}
     SLACK_WEBHOOK_URL: ${env:SLACK_WEBHOOK_URL}
@@ -33,6 +53,12 @@ functions:
     events:
       - httpApi:
           path: /slack/actions
+          method: POST
+  invoicePost:
+    handler: invoice_hawk/lambda_functions/invoice_post/main.handler
+    events:
+      - httpApi:
+          path: /invoice/post
           method: POST
 
 package:
