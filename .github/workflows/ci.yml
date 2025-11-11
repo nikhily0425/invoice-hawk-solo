@@ -9,3 +9,29 @@ jobs:
         with: { python-version: '3.11' }
       - run: pip install -r requirements.txt pytest
       - run: pytest -q
+  deploy-dryrun:
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Serverless CLI
+        run: npm install -g serverless
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Configure AWS credentials for OIDC
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
+      - name: Dry-run serverless package
+        run: serverless package --stage dev

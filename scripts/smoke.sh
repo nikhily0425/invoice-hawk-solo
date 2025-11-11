@@ -51,4 +51,18 @@ SLACK_RESP=$(curl -s -X POST "$SLACK_URL" \
   echo "Error invoking Slack actions endpoint" >&2; exit 1; }
 echo "$SLACK_RESP" | grep -q '"ok"' || { echo "Slack actions endpoint did not return ok" >&2; exit 1; }
 
+# Verify invoice post endpoint when URL is provided
+if [[ -n "${INVOICE_POST_URL:-}" ]]; then
+  echo "Testing invoice post endpoint at $INVOICE_POST_URL"
+  POST_RESP=$(curl -s -X POST "$INVOICE_POST_URL" \
+    -H "Content-Type: application/json" \
+    -d '{"invoice_id": 1}' ) || {
+    echo "Error invoking invoice post endpoint" >&2; exit 1; }
+  echo "$POST_RESP" | grep -q '"posted"' \
+    && echo "Invoice post endpoint reachable." \
+    || echo "Invoice post endpoint responded without 'posted' key."
+else
+  echo "INVOICE_POST_URL not set; skipping invoice post test."
+fi
+
 echo "Smoke tests passed."

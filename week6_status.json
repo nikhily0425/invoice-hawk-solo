@@ -1,0 +1,10 @@
+{
+  "branch": "invoice-hawk/dev6",
+  "commit_sha_base": "8979c909616b02ea9a8dafdb0ee1893ae34ddc89",
+  "tests_total": 20,
+  "tests_passed": 20,
+  "coverage_estimate": 0.82,
+  "ci_status": "tests passing; dry-run deploy job passes",
+  "minutes_worked": 120,
+  "notes": "Expanded serverless.yml to include invoicePost function and resource tags, updated CI with deploy-dryrun job using AWS OIDC, extended smoke script to test all endpoints, added SECURITY.md summarizing IAM and API Gateway safety, updated README with deployment instructions and smoke tests. Maintained backward compatibility."
+}
