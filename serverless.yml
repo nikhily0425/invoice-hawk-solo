@@ -6,27 +6,32 @@ provider:
   name: aws
   runtime: python3.11
   region: us-east-1
-  stage: dev
+  stage: ${opt:stage, 'dev'}
+
   iam:
     role:
       statements:
         - Effect: Allow
           Action:
             - s3:PutObject
+            - s3:GetObject
             - s3:ListBucket
           Resource:
             - arn:aws:s3:::${self:provider.environment.ARCHIVE_BUCKET}
             - arn:aws:s3:::${self:provider.environment.ARCHIVE_BUCKET}/*
+
         - Effect: Allow
           Action:
             - logs:CreateLogGroup
             - logs:CreateLogStream
             - logs:PutLogEvents
           Resource: "*"
-  # Tag all resources for cost tracking
+
+  # Tags for cost tracking
   tags:
     project: invoice-hawk
-    env: staging
+    env: ${self:provider.stage}
+
   environment:
     DATABASE_URL: ${env:DATABASE_URL}
     SLACK_WEBHOOK_URL: ${env:SLACK_WEBHOOK_URL}
@@ -36,24 +41,28 @@ provider:
     NETSUITE_BASE_URL: ${env:NETSUITE_BASE_URL}
     NETSUITE_TOKEN: ${env:NETSUITE_TOKEN}
     NETSUITE_ACCOUNT: ${env:NETSUITE_ACCOUNT}
-    NETSUITE_TEST_MODE: ${env:NETSUITE_TEST_MODE}
-    ARCHIVE_BUCKET: ${env:ARCHIVE_BUCKET}
+    NETSUITE_TEST_MODE: ${env:NETSUITE_TEST_MODE, 'true'}
+    ARCHIVE_BUCKET: ${env:ARCHIVE_BUCKET, 'invoice-hawk-${self:provider.stage}-archive'}
 
 functions:
+  # OCR Lambda supports S3 triggers + HTTP API
   ocrWorker:
     handler: invoice_hawk/lambda_functions/ocr_extract/main.handler
     events:
       - s3:
-          bucket: ${env:ARCHIVE_BUCKET}
+          bucket: ${self:provider.environment.ARCHIVE_BUCKET}
           event: s3:ObjectCreated:*
-          rules:
-            - suffix: .pdf
+      - httpApi:
+          path: /ocr
+          method: POST
+
   slackActions:
-    handler: invoice_hawk/slack_app.app
+    handler: invoice_hawk/slack_app.slack_actions
     events:
       - httpApi:
           path: /slack/actions
           method: POST
+
   invoicePost:
     handler: invoice_hawk/lambda_functions/invoice_post/main.handler
     events:
@@ -64,5 +73,33 @@ functions:
 package:
   patterns:
     - '!node_modules/**'
-    - '!**/*.test.*'
     - '!tests/**'
+    - '!**/*.test.*'
+
+resources:
+  Resources:
+    ArchiveBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.ARCHIVE_BUCKET}
+
+  Outputs:
+    OCRUrl:
+      Value: ${self:custom.httpApiUrl}/ocr
+      Description: "OCR API endpoint"
+
+    SlackActionsUrl:
+      Value: ${self:custom.httpApiUrl}/slack/actions
+      Description: "Slack actions endpoint"
+
+    InvoicePostUrl:
+      Value: ${self:custom.httpApiUrl}/invoice/post
+      Description: "Invoice post API endpoint"
+
+    ArchiveBucketName:
+      Value: ${self:provider.environment.ARCHIVE_BUCKET}
+      Description: "Archive bucket name"
+
+custom:
+  httpApiUrl:
+    Fn::Sub: "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}"

@@ -1,76 +1,104 @@
 """
-Lambda handler to extract invoice fields from a PDF using a pluggable OCR
-provider.
+AWS Lambda handler for OCR extraction.
 
-Triggered by an S3 object creation event.  Downloads the PDF from S3,
-submits it to the selected OCR provider, parses the returned JSON for key
-fields (vendor, invoice number, date, total, PO number, line quantities and
-prices), and stores the structured data in the Postgres database.
+Supports:
+1. HTTP API POST /ocr  (JSON: { "pdf_base64": "<base64>" })
+2. S3 ObjectCreated event (PDF uploaded to archive bucket)
+
+Performs OCR using the configured provider (GPT or fallback) and returns
+extracted invoice JSON. In S3 mode, it does NOT write to DB anymore
+(Wk7 moved persistence + posting into separate Lambdas).
 """
 
+import json
+import logging
+import base64
 import os
 from typing import Any, Dict
 
 import boto3
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
 
-from invoice_hawk.models import Base, Invoice, LineItem, AuditLog
 from invoice_hawk.ocr_provider import get_provider
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _download_pdf(bucket: str, key: str) -> bytes:
+    """Download PDF from S3 for S3-triggered OCR."""
     s3 = boto3.client("s3")
     obj = s3.get_object(Bucket=bucket, Key=key)
     return obj["Body"].read()
 
 
-def _get_db_session() -> Session:
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
-    engine = create_engine(db_url)
-    Base.metadata.create_all(engine)
-    return Session(engine)
+def _http_response(status: int, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Return Lambda HTTP API compatible response."""
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body),
+    }
 
 
-def _persist_invoice(session: Session, data: Dict[str, Any]) -> int:
-    invoice = Invoice(
-        vendor=data["vendor"],
-        invoice_number=data["invoice_number"],
-        invoice_date=data["invoice_date"],
-        total=data["total"],
-        purchase_order_number=data["purchase_order_number"],
-    )
-    for li in data.get("line_items", []):
-        invoice.line_items.append(
-            LineItem(
-                description=li.get("description"),
-                quantity=li.get("quantity", 0),
-                price=li.get("price", 0),
-            )
-        )
-    session.add(invoice)
-    session.add(
-        AuditLog(
-            invoice=invoice,
-            event_type="extracted",
-            details=data,
-        )
-    )
-    session.commit()
-    invoice_id = invoice.id
-    return invoice_id
+def handler(event, context):
+    """
+    Entry point for the OCR Lambda.
+    Supports both:
+    - HTTP invocation
+    - S3 event invocation
+    """
 
+    try:
+        # 1️⃣ --- HTTP POST /ocr ---
+        if "body" in event:
+            logger.info("Received HTTP OCR request")
 
-def handler(event, context):  # pragma: no cover - entry point called by AWS
-    record = event.get("Records", [])[0]
-    bucket = record["s3"]["bucket"]["name"]
-    key = record["s3"]["object"]["key"]
-    content = _download_pdf(bucket, key)
-    provider = get_provider()
-    extracted = provider.extract_fields(content)
-    session = _get_db_session()
-    invoice_id = _persist_invoice(session, extracted)
-    session.close()
-    return {"invoice_id": invoice_id, "status": "extracted"}
+            body_raw = event["body"]
+            if event.get("isBase64Encoded"):
+                body_raw = base64.b64decode(body_raw).decode()
+
+            try:
+                data = json.loads(body_raw)
+            except Exception:
+                return _http_response(400, {"error": "Invalid JSON body"})
+
+            pdf_b64 = data.get("pdf_base64")
+            if not pdf_b64:
+                return _http_response(400, {"error": "Missing pdf_base64"})
+
+            try:
+                pdf_bytes = base64.b64decode(pdf_b64)
+            except Exception:
+                return _http_response(400, {"error": "Invalid base64 PDF"})
+
+            provider = get_provider()
+            extracted = provider.extract_fields(pdf_bytes)
+
+            return _http_response(200, extracted)
+
+        # 2️⃣ --- S3 Event ---
+        if "Records" in event:
+            logger.info("Received S3 OCR event")
+
+            record = event["Records"][0]
+            bucket = record["s3"]["bucket"]["name"]
+            key = record["s3"]["object"]["key"]
+
+            pdf_bytes = _download_pdf(bucket, key)
+            provider = get_provider()
+            extracted = provider.extract_fields(pdf_bytes)
+
+            # S3-mode does NOT persist (that is handled by later pipeline steps)
+            return {
+                "status": "ok",
+                "source": "s3",
+                "vendor": extracted.get("vendor"),
+                "invoice_number": extracted.get("invoice_number"),
+            }
+
+        # 3️⃣ --- Unsupported event ---
+        return _http_response(400, {"error": "Unsupported invocation type"})
+
+    except Exception as e:
+        logger.exception("Unexpected OCR handler error: %s", e)
+        return _http_response(500, {"error": str(e)})

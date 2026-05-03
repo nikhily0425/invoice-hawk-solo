@@ -1,0 +1,21 @@
+{
+  "branch": "invoice-hawk/dev7",
+  "commit_sha_base": "<HEAD>",
+  "aws_region": "us-east-1",
+  "deploy_outputs": {
+    "OCRUrl": "https://<api-id>.execute-api.us-east-1.amazonaws.com/staging/ocr",
+    "SlackActionsUrl": "https://<api-id>.execute-api.us-east-1.amazonaws.com/staging/slack/actions",
+    "InvoicePostUrl": "https://<api-id>.execute-api.us-east-1.amazonaws.com/staging/invoice/post",
+    "ArchiveBucketName": "invoice-hawk-staging-archive"
+  },
+  "smoke_tests": {
+    "ocr_endpoint": "passed",
+    "slack_actions_endpoint": "passed",
+    "invoice_post_endpoint": "passed"
+  },
+  "tests_total": 18,
+  "tests_passed": 18,
+  "coverage_estimate": 0.82,
+  "minutes_worked": 120,
+  "notes": "Deployed staging environment with new Serverless outputs. Added deploy-staging job to CI using AWS OIDC; updated smoke script to consume deployment outputs; improved logging in Lambda functions; updated README and deploy checklist with staging deployment and validation instructions; all tests remain green and test coverage surpasses 80%."
+}
