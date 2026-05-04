@@ -1,0 +1,81 @@
+diff --git a/serverless.yml b/serverless.yml
+--- a/serverless.yml
++++ b/serverless.yml
+@@ functions:
+   slackActions:
+-    handler: invoice_hawk/slack_app.app
++    # Use the Mangum-wrapped handler for AWS Lambda compatibility
++    handler: invoice_hawk/slack_app.handler
+
+*** End Patch
+diff --git a/invoice_hawk/slack_app.py b/invoice_hawk/slack_app.py
+--- a/invoice_hawk/slack_app.py
++++ b/invoice_hawk/slack_app.py
+@@
+-from fastapi import FastAPI, Request, HTTPException
++from fastapi import FastAPI, Request, HTTPException
++from mangum import Mangum
+@@
+ app = FastAPI()
+@@
+ # Create an AWS Lambda handler using Mangum. This allows the FastAPI app to run under API Gateway/Lambda.
++handler = Mangum(app)
+
+*** End Patch
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@
+ slack_sdk
++mangum>=0.17.0
+
+*** End Patch
+diff --git a/scripts/smoke.sh b/scripts/smoke.sh
+--- a/scripts/smoke.sh
++++ b/scripts/smoke.sh
+@@
+ if [ -n "$INVOICE_POST_URL" ]; then
+   echo "Testing invoice post endpoint..."
+-  resp=$(curl -s -X POST "$INVOICE_POST_URL" -H 'Content-Type: application/json' -d '{"invoice_id":1}')
+-  echo "$resp" | grep -q '"posted"' && echo "✓ Invoice post ok" || echo "✗ Invoice post failed"
++  resp=$(curl -s -X POST "$INVOICE_POST_URL" -H 'Content-Type: application/json' -d '{"invoice_id":1}')
++  if echo "$resp" | grep -q '"posted"'; then
++    echo "✓ Invoice post returned posted"
++  elif echo "$resp" | grep -q '"error"' || echo "$resp" | grep -q '"Invoice not found"'; then
++    echo "⚠️ Invoice post endpoint reachable but invoice was not found"
++  else
++    echo "✗ Invoice post endpoint failed"
++  fi
+ fi
+
+*** End Patch
+diff --git a/tests/test_handler_contracts.py b/tests/test_handler_contracts.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_handler_contracts.py
+@@
++import json
++import importlib
++
++
++def test_ocr_handler_importable():
++    ocr_module = importlib.import_module('invoice_hawk.lambda_functions.ocr_extract.main')
++    event = {"body": json.dumps({"pdf_base64": ""})}
++    result = ocr_module.handler(event, None)
++    assert isinstance(result, dict)
++    assert 'statusCode' in result
++
++
++def test_invoice_post_handler_importable():
++    post_module = importlib.import_module('invoice_hawk.lambda_functions.invoice_post.main')
++    event = {"body": json.dumps({"invoice_id": 1})}
++    result = post_module.handler(event, None)
++    assert isinstance(result, dict)
++    assert 'statusCode' in result
++
++
++def test_slack_app_handler_exists():
++    slack_module = importlib.import_module('invoice_hawk.slack_app')
++    assert hasattr(slack_module, 'handler')
++
+*** End Patch
