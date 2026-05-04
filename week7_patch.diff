@@ -1,0 +1,353 @@
+diff --git a/serverless.yml b/serverless.yml
+index abcdef1..abcdef2 100644
+--- a/serverless.yml
++++ b/serverless.yml
+@@ provider:
+   stage: ${opt:stage, 'dev'}
+@@
+   tags:
+     project: invoice-hawk
+-    env: ${self:provider.stage}
++    env: ${self:provider.stage}
+@@
+ functions:
+   ocrWorker:
+     handler: invoice_hawk/lambda_functions/ocr_extract/main.handler
+     events:
+       - s3:
+           bucket: ${self:provider.environment.ARCHIVE_BUCKET}
+           event: s3:ObjectCreated:*
++      - httpApi:
++          path: /ocr
++          method: POST
+@@
+ resources:
+   Resources:
+     ArchiveBucket:
+       Type: AWS::S3::Bucket
+       Properties:
+         BucketName: ${self:provider.environment.ARCHIVE_BUCKET}
++  Outputs:
++    OCRUrl:
++      Description: "OCR API endpoint"
++      Value: ${self:custom.httpApiUrl}/ocr
++    SlackActionsUrl:
++      Description: "Slack actions API endpoint"
++      Value: ${self:custom.httpApiUrl}/slack/actions
++    InvoicePostUrl:
++      Description: "Invoice post API endpoint"
++      Value: ${self:custom.httpApiUrl}/invoice/post
++    ArchiveBucketName:
++      Description: "Name of the archive bucket"
++      Value: ${self:provider.environment.ARCHIVE_BUCKET}
++
++custom:
++  httpApiUrl:
++    Fn::Sub: "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}"
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index abcdef1..abcdef2 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@
+ jobs:
+   test:
+     # existing test job
+   deploy-dryrun:
+     # existing dryrun job
++  deploy-staging:
++    needs: test
++    if: github.ref == 'refs/heads/main'
++    runs-on: ubuntu-latest
++    permissions:
++      id-token: write
++      contents: read
++    steps:
++      - uses: actions/checkout@v3
++      - uses: actions/setup-node@v3
++        with:
++          node-version: 18
++      - uses: actions/setup-python@v3
++        with:
++          python-version: '3.11'
++      - name: Install Serverless CLI
++        run: npm install -g serverless
++      - name: Install Python dependencies
++        run: pip install -r requirements.txt
++      - name: Configure AWS credentials
++        uses: aws-actions/configure-aws-credentials@v3
++        with:
++          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_TO_ASSUME }}
++          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
++      - name: Deploy to staging
++        run: serverless deploy --stage staging
+
+diff --git a/scripts/smoke.sh b/scripts/smoke.sh
+index abcdef1..abcdef2 100755
+--- a/scripts/smoke.sh
++++ b/scripts/smoke.sh
+@@
+-# Existing logic
++#!/bin/bash
++
++# Load endpoints from deployment outputs if provided
++if [ -f deployment_outputs.json ]; then
++  OCR_URL=$(jq -r '.OCRUrl' deployment_outputs.json)
++  SLACK_URL=$(jq -r '.SlackActionsUrl' deployment_outputs.json)
++  INVOICE_POST_URL=$(jq -r '.InvoicePostUrl' deployment_outputs.json)
++fi
++
++echo "Using endpoints:"
++echo " OCR_URL=$OCR_URL"
++echo " SLACK_URL=$SLACK_URL"
++echo " INVOICE_POST_URL=$INVOICE_POST_URL"
++
++# OCR endpoint test
++if [ -n "$OCR_URL" ]; then
++  echo "Testing OCR endpoint..."
++  resp=$(curl -s -X POST "$OCR_URL" -H "Content-Type: application/json" -d '{"pdf_base64":"dGhpcyBpcyBhIHRlc3QgcGRm"}')
++  echo "$resp" | grep -q '"vendor"' && echo "✓ OCR response contains vendor" || echo "✗ OCR response missing vendor"
++fi
++
++# Slack actions test
++if [ -n "$SLACK_URL" ]; then
++  echo "Testing Slack actions endpoint..."
++  timestamp=$(date +%s)
++  payload='payload={"type":"block_actions","actions":[{"action_id":"approve_invoice","value":"1"}],"user":{"id":"U123"},"token":"verification"}'
++  signature=""
++  if [ -n "$SLACK_SECRET" ]; then
++    signature=$(printf "v0:%s:%s" "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$SLACK_SECRET" -hex | sed 's/^.* //')
++  fi
++  resp=$(curl -s -X POST "$SLACK_URL" \
++    -H "Content-Type: application/x-www-form-urlencoded" \
++    -H "X-Slack-Request-Timestamp: $timestamp" \
++    -H "X-Slack-Signature: v0=$signature" \
++    --data "$payload")
++  echo "$resp" | grep -q '"ok"' && echo "✓ Slack actions ok" || echo "✗ Slack actions failed"
++fi
++
++# Invoice post test
++if [ -n "$INVOICE_POST_URL" ]; then
++  echo "Testing invoice post endpoint..."
++  resp=$(curl -s -X POST "$INVOICE_POST_URL" -H "Content-Type: application/json" -d '{"invoice_id":1}')
++  echo "$resp" | grep -q '"posted"' && echo "✓ Invoice post ok" || echo "✗ Invoice post failed"
++fi
+
+diff --git a/README.md b/README.md
+index abcdef1..abcdef2 100644
+--- a/README.md
++++ b/README.md
+@@
+ The ``serverless deploy`` command will output the URL of the OCR and
+ Slack API endpoints.  These endpoints are used by the smoke test
+ script.
++
++## Staging Deployment and Validation
++
++To deploy a staging stack, configure AWS credentials and run:
++
++```bash
++serverless deploy --stage staging
++```
++
++Serverless will deploy the OCR, Slack actions, and invoice post Lambdas, create the archive S3 bucket if not provided, and tag all resources with ``project=invoice-hawk`` and ``env=staging``. After deployment, you can retrieve endpoint URLs using:
++
++```bash
++serverless info --stage staging --format json > deployment_outputs.json
++```
++
++### Verifying the staging environment
++
++Use the updated ``scripts/smoke.sh`` to validate the deployment. Ensure ``deployment_outputs.json`` is in the current directory or set ``OCR_URL``, ``SLACK_URL``, and ``INVOICE_POST_URL`` environment variables. The script will:
++
++1. Send a base64‑encoded PDF to the OCR endpoint and check for expected fields.
++2. Send a signed Slack action payload to the Slack actions endpoint and expect ``{ \"ok\": true }``.
++3. Post to the invoice post endpoint and expect a ``posted`` response with an ``external_id``.
++
++### Rollback and log inspection
++
++To remove the staging stack:
++
++```bash
++serverless remove --stage staging
++```
++
++Logs are written to CloudWatch under ``/aws/lambda/invoice-hawk-staging-ocrWorker``, ``...-slackActions``, and ``...-invoicePost``. Use the AWS console to inspect logs for debugging.
+
+diff --git a/deploy_checklist.md b/deploy_checklist.md
+index abcdef1..abcdef2 100644
+--- a/deploy_checklist.md
++++ b/deploy_checklist.md
+@@
+ ## Smoke Test Verification
+-Describe how to run smoke tests.
++After deploying to staging, verify the endpoints by running the smoke script:
++
++```bash
++export OCR_URL=<OCR endpoint>
++export SLACK_URL=<Slack actions endpoint>
++export INVOICE_POST_URL=<Invoice post endpoint>
++export SLACK_SECRET=<Slack signing secret>
++bash scripts/smoke.sh
++```
++
++The script will call each endpoint and check for expected keys.
++
++## Rollback
++
++To roll back the staging environment:
++
++```bash
++serverless remove --stage staging
++```
++
++This will delete the deployed resources. Note that the archive S3 bucket and its contents will be removed.
++
++## Log Inspection
++
++For troubleshooting, view CloudWatch logs for functions prefixed with ``invoice-hawk-staging``. Look for info and error logs to ensure correct behaviour.
+
+diff --git a/invoice_hawk/lambda_functions/ocr_extract/main.py b/invoice_hawk/lambda_functions/ocr_extract/main.py
+index abcdef1..abcdef2 100644
+--- a/invoice_hawk/lambda_functions/ocr_extract/main.py
++++ b/invoice_hawk/lambda_functions/ocr_extract/main.py
+@@
+-import json
++import json
++import logging
++import base64
+@@
+-def handler(event, context):
+-    # existing implementation
++logger = logging.getLogger(__name__)
++logger.setLevel(logging.INFO)
++
++def handler(event, context):
++    """
++    Lambda handler for OCR extraction. Supports HTTP API (JSON body with pdf_base64)
++    and S3 event triggers.
++    """
++    try:
++        # HTTP API invocation
++        if event.get('body') is not None:
++            body = event['body']
++            if event.get('isBase64Encoded'):
++                body = base64.b64decode(body).decode()
++            data = json.loads(body)
++            pdf_b64 = data.get('pdf_base64')
++            if not pdf_b64:
++                return {"statusCode": 400, "body": json.dumps({"error": "Missing pdf_base64"})}
++            pdf_bytes = base64.b64decode(pdf_b64)
++            logger.info("Received OCR HTTP request")
++            from invoice_hawk.ocr_provider import get_provider
++            provider = get_provider()
++            invoice = provider.extract_fields(pdf_bytes)
++            return {"statusCode": 200, "body": json.dumps(invoice)}
++        # S3 event processing remains unchanged
++        logger.info("Received OCR S3 event")
++        # existing S3 flow...
++    except Exception as e:
++        logger.exception("Error in OCR handler: %s", e)
++        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+diff --git a/invoice_hawk/lambda_functions/invoice_post/main.py b/invoice_hawk/lambda_functions/invoice_post/main.py
+index abcdef1..abcdef2 100644
+--- a/invoice_hawk/lambda_functions/invoice_post/main.py
++++ b/invoice_hawk/lambda_functions/invoice_post/main.py
+@@
+-import json
+-
+-def handler(event, context):
+-    # existing implementation
++import json
++import base64
++import logging
++from invoice_hawk.utils import get_db_session
++from invoice_hawk.models import Invoice, AuditLog
++from invoice_hawk.netsuite_client import NetSuiteClient
++
++logger = logging.getLogger(__name__)
++logger.setLevel(logging.INFO)
++
++def handler(event, context):
++    """
++    Lambda handler to post an invoice to NetSuite. Expects JSON body with invoice_id.
++    Returns a JSON response with posted status and external_id.
++    """
++    try:
++        body = event.get('body')
++        if not body:
++            return {"statusCode": 400, "body": json.dumps({"error": "Missing request body"})}
++        if event.get('isBase64Encoded'):
++            body = base64.b64decode(body).decode()
++        data = json.loads(body)
++        invoice_id = data.get('invoice_id')
++        if not invoice_id:
++            return {"statusCode": 400, "body": json.dumps({"error": "Missing invoice_id"})}
++        logger.info("Invoice post request for ID %s", invoice_id)
++        with get_db_session() as session:
++            invoice = session.get(Invoice, invoice_id)
++            if not invoice:
++                return {"statusCode": 404, "body": json.dumps({"error": "Invoice not found"})}
++            client = NetSuiteClient()
++            result = client.post_invoice(invoice)
++            external_id = result.get('external_id')
++            if external_id:
++                invoice.external_id = external_id
++                invoice.status = "posted"
++                session.add(AuditLog(event_type="post_to_netsuite", details={"external_id": external_id}, invoice=invoice))
++                session.commit()
++                return {"statusCode": 200, "body": json.dumps({"posted": True, "external_id": external_id})}
++            else:
++                return {"statusCode": 502, "body": json.dumps({"error": "Failed to post invoice"})}
++    except Exception as e:
++        logger.exception("Error in invoice_post handler: %s", e)
++        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+diff --git a/invoice_hawk/slack_app.py b/invoice_hawk/slack_app.py
+index abcdef1..abcdef2 100644
+--- a/invoice_hawk/slack_app.py
++++ b/invoice_hawk/slack_app.py
+@@
+-import logging
++import logging
++from invoice_hawk.netsuite_client import NetSuiteClient
+@@ async def slack_actions(request: Request):
+@@
+         action_id = actions[0]["action_id"]
+         invoice_id = actions[0]["value"]
+         invoice = db.query(Invoice).get(int(invoice_id))
+-        if action_id == "approve_invoice":
+-            invoice.status = "approved"
+-            audit = AuditLog(event_type="slack_action", details={"action": "approve"}, invoice=invoice)
+-            db.add(audit)
+-            db.commit()
+-        elif action_id == "reject_invoice":
+-            invoice.status = "rejected"
+-            audit = AuditLog(event_type="slack_action", details={"action": "reject"}, invoice=invoice)
+-            db.add(audit)
+-            db.commit()
++        if action_id == "approve_invoice":
++            invoice.status = "approved"
++            audit = AuditLog(event_type="slack_action", details={"action": "approve_invoice"}, invoice=invoice)
++            db.add(audit)
++            db.commit()
++            # Post to NetSuite and update invoice
++            try:
++                client = NetSuiteClient()
++                result = client.post_invoice(invoice)
++                ext_id = result.get("external_id")
++                if ext_id:
++                    invoice.external_id = ext_id
++                    invoice.status = "posted"
++                    db.add(AuditLog(event_type="post_to_netsuite", details={"external_id": ext_id}, invoice=invoice))
++                    db.commit()
++                    logger.info("Invoice %s approved and posted to NetSuite", invoice.id)
++            except Exception as ex:
++                logger.exception("Failed to post invoice after approval: %s", ex)
++        elif action_id == "reject_invoice":
++            invoice.status = "rejected"
++            audit = AuditLog(event_type="slack_action", details={"action": "reject_invoice"}, invoice=invoice)
++            db.add(audit)
++            db.commit()
++            logger.info("Invoice %s rejected", invoice.id)

@@ -134,3 +134,38 @@ This MVP is designed to minimise AWS costs:
   these costs lower.
 - **NetSuite** – The client operates in test mode by default, avoiding
   any charges or API rate limits.
+
+
+
+  # Invoice Hawk – Deployment Checklist (Week 7)
+
+## 1. Prerequisites
+- AWS IAM credentials or GitHub OIDC
+- Serverless Framework
+- Required env vars (DATABASE_URL, SLACK_SIGNING_SECRET, etc.)
+
+## 2. Deploy
+serverless deploy --stage staging
+
+## 3. Get Endpoints
+serverless info --stage staging --format json > deployment_outputs.json
+
+## 4. Smoke Tests
+export OCR_URL=...
+export SLACK_URL=...
+export INVOICE_POST_URL=...
+export SLACK_SECRET=...
+bash scripts/smoke.sh
+
+## 5. CI/CD Dry Run
+- GitHub Action: deploy-dryrun  
+- Trigger manually or by tag
+
+## 6. Rollback
+serverless remove --stage staging
+
+## 7. Logs
+View logs:
+/aws/lambda/invoice-hawk-staging-ocrWorker  
+/aws/lambda/invoice-hawk-staging-slackActions  
+/aws/lambda/invoice-hawk-staging-invoicePost
